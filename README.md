@@ -147,28 +147,81 @@ SELECT * FROM uber.silver.silver_obt LIMIT 10;
 SELECT * FROM uber.gold.fact LIMIT 10;
 ```
 
-## Phase 6b - Homework from the video: generate `silver_obt.sql` with Jinja (optional)
-Ansh's homework is to stop copy-pasting the rendered Jinja output and write it into the `.sql` file
-automatically. `tools/render_silver_obt.py` does that:
-- `JINJA_CONFIG` = one entry per table (join, select columns, optional where), like his `silver_obt.ipynb`
-- the Jinja template loops over it (`for`, `if loop.first / loop.last`, variables) and builds the
-  `CREATE OR REFRESH STREAMING TABLE ... SELECT ... LEFT JOIN ...` statement
-- the script writes the result straight into `databricks/silver_obt.sql`
+## Phase 6b - Jinja: generate `silver_obt.sql` automatically (Ansh's homework)
+In his project the Jinja lives in a notebook that builds the OBT query; his homework is to write the rendered
+SQL into a `.sql` file automatically instead of copy-pasting it. Both versions are here:
 
-**Code:** `tools/render_silver_obt.py`
-**Run (locally, any time you change the config):**
+**A. In Databricks, like him (use this one):** `databricks/02_silver_obt_jinja.py`
+- Import it as a notebook. Edit `PROJECT_FOLDER` / `PIPELINE_FOLDER` at the top if your pipeline folder differs.
+- It holds `JINJA_CONFIG` (one entry per table), renders the Jinja template (`for`, `if`, variables) and writes
+  the result into `.../<PIPELINE_FOLDER>/transformations/silver_obt.sql` with Python `pathlib`.
+- Run it once by hand, then run the pipeline (dry run first). In the Job it runs before the pipeline (Phase 7).
+- Writing into a workspace folder from a notebook is untested on Free Edition. If the last cell errors, the
+  rendered SQL is printed above it: paste it into `silver_obt.sql` by hand.
+- If `jinja2` is missing: run `%pip install jinja2` in a cell above.
+
+**B. On your laptop (alternative):** `tools/render_silver_obt.py`
 ```bash
-uv run python tools/render_silver_obt.py
+uv run python tools/render_silver_obt.py             # rewrites databricks/silver_obt.sql only
+uv run python tools/render_silver_obt.py --upload    # also uploads it into the pipeline's transformations folder
 ```
-**Check:** `databricks/silver_obt.sql` is rewritten. The output is the same query as the hand-written
-version (6 LEFT JOINs); then re-upload that file as the pipeline source.
+`--upload` needs DATABRICKS_HOST and DATABRICKS_TOKEN in `.env`. It uses the plain-file import format (so the
+`.sql` stays a file, not a notebook) and prints the object type it created: you want `FILE`. Folder names default to
+`Uber_Project` / `uber_rides_ingest`; change them with `--project-folder` and `--pipeline-folder`.
+Untested on Free Edition. If it fails or says NOTEBOOK, paste the printed SQL into `silver_obt.sql` by hand.
+If you use `--upload`, remove the notebook task `02_silver_obt_jinja` from the Job (both write the same file).
+Without `--upload`, paste or import the generated file into the pipeline yourself.
 
-*Inside Databricks instead (like him):* build the same `rendered` string in a notebook and write it with
-`Path("/Workspace/Users/<you>/.../silver_obt.sql").write_text(rendered)` (Python `os`/`pathlib`).
-I haven't tested writing to workspace paths on Free Edition.
+Either way the output is the same query as the hand-written `databricks/silver_obt.sql`. The pipeline itself
+never runs Jinja, it only reads the finished `.sql` file.
 
-## Phase 7 - Orchestrate
-Jobs & Pipelines -> Create job -> task type "Pipeline" -> pick the pipeline -> add a schedule.
+## Phase 7 - Orchestrate (do this after the pipeline works by hand)
+Jobs & Pipelines -> Create -> Job, with tasks in this order (same shape as Ansh's Job):
+1. `Bronze_Static` - Notebook task -> `01_bronze_static` (loads map_* tables and bulk_rides)
+2. `Silver_Process` - Notebook task -> `02_silver_obt_jinja` (renders and writes `silver_obt.sql`), depends on 1
+3. `OBT_Data_Model` - Pipeline task -> your pipeline, depends on 2
+
+Before putting notebook 01 in the Job, delete its last test cell (`SELECT * FROM uber.bronze.rides_raw`).
+Then add a schedule. Booking rides and the consumer/sync scripts on your laptop stay outside the Job.
+
+## Adding more history later (optional, dynamic bulk load)
+Notebook 01 no longer skips `bulk_rides` once it exists. First run: it loads all 2000 rides. Later runs: a
+MERGE inserts only rides whose `ride_id` is not in the table yet. Existing rides are never changed (the pipeline
+reads this table as a stream, so only new rows are safe to add), and running it twice adds nothing.
+1. Add rides to the file: `uv run python tools/add_bulk_rides.py --n 100` (appends 100 new fake rides to `data/bulk_rides.json`)
+2. Commit and push `data/bulk_rides.json` to GitHub.
+3. Run the Job: notebook 01 downloads the file and adds the 100 new rides, the pipeline carries them to
+   silver and gold (`stg_rides`: 2000 -> 2100, plus any live rides).
+Untested on Databricks. If the pipeline complains about updates or deletes in `bulk_rides`, change the bulk read
+in `silver.py` to `spark.readStream.option("skipChangeCommits", "true").table("uber.bronze.bulk_rides")`.
+
+## SCD2 test (optional demo for `dim_location`)
+This is the same split as Ansh's project: the static GitHub file changes (his ADF path, your notebook 01 download),
+and new rides arrive through Kafka (his Event Hubs). SCD2 only records a new version when a **new ride** for that
+city passes through, so changing the map file alone is not enough.
+
+**Kafka way (recommended, same as the real flow)**
+1. Edit `data/map_cities.json`: for city 7 change `region` and set a **newer** `updated_at`
+   (e.g. `"2025-06-01T00:00:00"`). Commit and push to GitHub.
+2. Start Docker, then the consumer and `--watch` sync (Phases 1, 3 and 5).
+3. Send rides, forcing them into city 7 so the test is guaranteed:
+   ```bash
+   uv run python app/simulate.py --n 10 --city 7 --delay 0.1
+   ```
+   (Booking in the web app also works, but the city is random: about 30 rides give ~96% chance of hitting city 7.)
+4. Wait until a new file appears in the Volume's `rides_stream/`.
+5. Run the Job (notebook 01 reloads `map_cities` from GitHub, notebook 02 renders the SQL, the pipeline runs).
+6. Check the history:
+   ```sql
+   SELECT pickup_city_id, pickup_city, region, city_updated_at, __START_AT, __END_AT
+   FROM uber.gold.dim_location WHERE pickup_city_id = 7 ORDER BY __START_AT;
+   ```
+   Expected: the old row has `__END_AT` filled, the new row has `__END_AT` null.
+
+**No-Docker alternative:** `uv run python tools/generate_rides_file.py --n 10 --city 7 --upload` writes the ride
+file straight into the Volume (needs the token in `.env`) and skips Kafka and MinIO.
+
+A full refresh of the pipeline rebuilds everything with the new value and loses the history, so use a normal run.
 
 ## The day-to-day loop (after everything is built)
 Keep these running, one terminal each:
