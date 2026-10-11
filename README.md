@@ -1,6 +1,12 @@
-<div align="center">
-
-# 🚕 End-to-End Uber Data Engineering Project
+<h1 align="center">
+  🚕
+  <img src="https://cdn.simpleicons.org/uber/FFFFFF"
+       alt="Uber logo"
+       width="32"
+       height="32"
+       style="vertical-align: middle;" />
+  End-to-End Uber Data Engineering Project
+</h1>
 
 ### Kafka · MinIO · Databricks Free Edition · PySpark · Delta Lake
 
